@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using Microsoft.AspNetCore.Mvc;
@@ -9,6 +10,9 @@ using Microsoft.AspNetCore.Http;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using Microsoft.Extensions.Logging;
+using Newtonsoft.Json.Linq;
+using System.Linq;
+using Newtonsoft.Json;
 
 namespace com.joshspicer
 {
@@ -16,61 +20,73 @@ namespace com.joshspicer
     {
         // PartitionKey and RowKey implied.
         public string AccessToken { get; set; }
-        public string RefreshToken { get; set; }
+        public string RefreshTokenLeft { get; set; }
+        public string RefreshTokenRight { get; set; }
         public DateTime ExpiresAt { get; set; }
         public string MonthlyPlaylistId { get; set; }
-
-        public void Deconstruct(out string accessToken, out string refreshToken, out DateTime expiresAt, out string monthlyPlaylistId)
-        {
-            accessToken = AccessToken;
-            refreshToken = RefreshToken;
-            expiresAt = ExpiresAt;
-            monthlyPlaylistId = MonthlyPlaylistId;
-        }
     }
 
     public static class quick_playlist
     {
         static HttpClient httpClient = new HttpClient();
+        static ILogger log;
 
         [FunctionName("monthlyplaylist")]
         public static async Task<IActionResult> Run(
-            [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+            [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
             [Table("spotify")] CloudTable cTable,
-            ILogger log)
+            ILogger _log)
         {
+            // Access logging globally.
+            log = _log;
+
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            dynamic data = JsonConvert.DeserializeObject(requestBody);
+
             // Simple Auth
             string env_passphrase = GetEnvironmentVariable("MY_PASSPHRASE");
-            string passphrase = req.Query["passphrase"];  // TODO: move to POST
+            string passphrase = data?["passphrase"];
             if (!passphrase.Equals(env_passphrase, StringComparison.Ordinal))
-                return new OkObjectResult($"nicee");
+                return new OkObjectResult($"done");
 
             // Validate Input
-            string playlist = req.Query["playlist"];
-            if (!isValid(playlist))
-                return new OkObjectResult("niceee");
+            string playlist = data?["playlist"];
+            if (playlist != null && !isValid(playlist))
+                return new OkObjectResult("done.");
 
             // Grab our data from storage.
             var sDetails = await GetSpotify(cTable);
 
             // Check if access token expired.
-            if (sDetails.ExpiresAt.CompareTo(DateTime.Now) >= 0)
+            if (sDetails.ExpiresAt.ToUniversalTime().CompareTo(DateTime.Now.ToUniversalTime()) <= 0)
             {
-                sDetails.AccessToken = await RefreshTokenAndUpdate(cTable);
+                log.LogInformation("[+] Refreshing token.");
+                sDetails.AccessToken = await RefreshTokenAndUpdate(cTable, sDetails);
+            }
+            else
+            {
+                log.LogInformation("[+] Not refreshing token.");
             }
 
-            // if (string.IsNullOrEmpty(playlist))
-            // {
-            //     await AddSongToPlaylist(sDetails);
-            // }
+            // Determine what mode we're in
+            if (!string.IsNullOrEmpty(playlist))
+            {
+                // Provided a playlist. Update monthly playlist.
+                await UpdateMonthlyPlaylist(cTable, playlist, sDetails);
+            }
+            else
+            {
+                // No playlist provided. Function normally.
+                await AddSongToPlaylist(sDetails);
+            }
 
-            return new OkObjectResult("niceeeee");
+            return new OkObjectResult("Completed.");
         }
 
+        /// Playlist IDs are base-62 [a-zA-Z0-9] encoded
         public static bool isValid(string playlist)
         {
-            // TODO
-            return true;
+            return playlist.All(Char.IsLetterOrDigit);
         }
 
         /// Add a song to playlist
@@ -82,23 +98,45 @@ namespace com.joshspicer
             // Get current song Josh is listening to
             string uri = "https://api.spotify.com/v1/me/player/currently-playing";
             HttpResponseMessage res = await httpClient.GetAsync(uri);
-            Console.WriteLine(res);
 
+            if (!res.StatusCode.Equals(System.Net.HttpStatusCode.OK))
+                log.LogError($"[-] Error Getting current playing song ({res.StatusCode})");
 
-            // Post song to playlist.
-            // uri = $"https://api.spotify.com/v1/users/joshspicer37/playlists/{playlistID}/tracks?uris={songID}";
-            // res = await httpClient.PostAsync(uri, new MultipartContent());
-            // Console.Write(res);
+            string songID = JObject.Parse(await res.Content.ReadAsStringAsync()).SelectToken("item.uri").Value<string>();
+            log.LogInformation($"[+] songID={songID}");
+
+            string username = GetEnvironmentVariable("SPOT_USERNAME");
+
+            //Post song to playlist.
+            uri = $"https://api.spotify.com/v1/users/{username}/playlists/{playlistID}/tracks?uris={songID}";
+            res = await httpClient.PostAsync(uri, new MultipartContent());
+
+            if (!res.StatusCode.Equals(System.Net.HttpStatusCode.Created))
+                log.LogError($"[-] Error posting song to playlit ({res.StatusCode})");
+
+            log.LogInformation($"[+] Posting song to playlist: {res.StatusCode}");
+
+        }
+
+        /// Update the monthly playlist
+        public static async Task UpdateMonthlyPlaylist(CloudTable cTable, string playlistId, SpotifyDetails sDetails)
+        {
+            SpotifyDetails sCreds = new SpotifyDetails()
+            {
+                PartitionKey = "1",
+                RowKey = "1",
+                MonthlyPlaylistId = playlistId,
+                ExpiresAt = sDetails.ExpiresAt
+            };
+            await cTable.ExecuteAsync(TableOperation.InsertOrMerge(sCreds));
         }
 
         /// Update the Token
-        public static async Task<string> RefreshTokenAndUpdate(CloudTable cTable)
+        public static async Task<string> RefreshTokenAndUpdate(CloudTable cTable, SpotifyDetails sDetails)
         {
-
-
             // Refresh our access token.
             var clientIdClientSecret = GetEnvironmentVariable("CLIENTIDCLIENTSECRET");
-            var refresh_token = GetEnvironmentVariable("REFRESH_TOKEN");
+            var refresh_token = $"{sDetails.RefreshTokenLeft}{sDetails.RefreshTokenRight}";
 
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", clientIdClientSecret);
             var uri = "https://accounts.spotify.com/api/token";
@@ -107,23 +145,25 @@ namespace com.joshspicer
                 {"grant_type", "refresh_token"},
                 {"refresh_token", refresh_token }
             }));
+            log.LogInformation($"[+] Refreshed Token: {res.StatusCode}");
 
-            // string newAccessToken;
+            // Parse out returned access token.
+            var newAccessToken = "";
+            if (JObject.Parse(await res.Content.ReadAsStringAsync()).TryGetValue("access_token", out var token))
+            {
+                newAccessToken = token.Value<string>() ?? "";
+            }
 
-            Console.WriteLine(res);
-            Console.Write(res.Content.ReadAsStringAsync());
+            SpotifyDetails sCreds = new SpotifyDetails()
+            {
+                PartitionKey = "1",
+                RowKey = "1",
+                AccessToken = newAccessToken,
+                ExpiresAt = DateTime.Now.AddMinutes(55)
+            };
 
-            // SpotifyDetails sCreds = new SpotifyDetails()
-            // {
-            //     PartitionKey = "1",
-            //     RowKey = "1",
-            //     AccessToken = newAccessToken,
-            //     ExpiresAt = new DateTime().AddMinutes(55)
-            // };
-
-            // await cTable.ExecuteAsync(TableOperation.InsertOrReplace(sCreds));
-
-            return "newAccessToken";
+            await cTable.ExecuteAsync(TableOperation.InsertOrMerge(sCreds));
+            return newAccessToken;
         }
 
         /// Get the token
